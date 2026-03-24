@@ -77,9 +77,9 @@ ask() {
 ask_password() {
     local prompt="$1" answer
     printf "${BOLD}%s${NC}: " "$prompt" >&2
-    stty -echo 2>/dev/null
-    read -r answer
-    stty echo 2>/dev/null
+    stty -F /dev/tty -echo 2>/dev/null || stty -echo 2>/dev/null
+    read -r answer < /dev/tty
+    stty -F /dev/tty echo 2>/dev/null || stty echo 2>/dev/null
     printf "\n" >&2
     echo "$answer"
 }
@@ -290,7 +290,7 @@ test_connection() {
 
         # Извлечь хэш сертификата
         local hash
-        hash=$(grep "^FINGERPRINT=" "$AUTH_LOG" | head -1 | cut -d= -f2)
+        hash=$(grep "^FINGERPRINT=" "$AUTH_LOG" | head -1 | cut -d= -f2 | tr -d "'" | tr -d '"')
         if [ -n "$hash" ]; then
             VPN_SERVERHASH="$hash"
             info "Хэш сертификата: $hash"
