@@ -489,7 +489,7 @@ setup_podkop() {
 
     # Пользовательские домены
     uci set "podkop.$PODKOP_SECTION.user_domain_list_type=text"
-    uci set "podkop.$PODKOP_SECTION.user_domain_list=$CORP_DOMAINS"
+    uci set "podkop.$PODKOP_SECTION.user_domains_text=$CORP_DOMAINS"
 
     uci commit podkop
 
