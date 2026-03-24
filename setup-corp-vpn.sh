@@ -20,6 +20,7 @@
 # ============================================================
 IFACE_NAME="corp_vpn"
 PODKOP_SECTION="corp"
+PODKOP_PROXY_SECTION="corp_proxy"
 VPNC_SCRIPT="/lib/netifd/vpnc-script"
 AUTH_LOG="/tmp/oc_auth_result.log"
 DAILY_SCRIPT="/usr/bin/corp-vpn"
@@ -33,6 +34,9 @@ VPN_GROUP=""
 VPN_SERVERHASH=""
 CORP_DNS=""
 CORP_DOMAINS=""
+PROXY_SERVER=""
+PROXY_PORT=""
+PROXY_DOMAINS=""
 
 # ============================================================
 # Цвета
@@ -509,6 +513,80 @@ setup_podkop() {
 }
 
 # ============================================================
+# Шаг 6b: HTTP-прокси для части корп. ресурсов
+# ============================================================
+gather_proxy_info() {
+    echo ""
+    info "Некоторые корп. ресурсы (Jira, Confluence и т.д.) могут быть доступны"
+    info "только через HTTP-прокси внутри VPN. Обычно это настраивается"
+    info "расширением ProxyOmega или PAC-файлом в браузере."
+    echo ""
+
+    if ! ask_yesno "Нужен ли HTTP-прокси для части корп. ресурсов?" "n"; then
+        return 0
+    fi
+
+    echo ""
+    info "Параметры прокси — из расширения ProxyOmega / настроек браузера."
+    PROXY_SERVER=$(ask "IP-адрес прокси-сервера" "198.18.4.1")
+    PROXY_PORT=$(ask "Порт прокси" "3129")
+
+    echo ""
+    info "Введите домены, которым нужен прокси (через пробел)."
+    info "Пример: jira.company.com confluence.company.com"
+    PROXY_DOMAINS=$(ask "Домены для прокси")
+}
+
+setup_podkop_proxy() {
+    if [ -z "$PROXY_DOMAINS" ] || [ -z "$PROXY_SERVER" ]; then
+        return 0
+    fi
+
+    info "Настройка прокси-секции Podkop..."
+
+    if uci -q get "podkop.$PODKOP_PROXY_SECTION" > /dev/null 2>&1; then
+        warn "Секция '$PODKOP_PROXY_SECTION' уже существует в Podkop."
+        if ask_yesno "Перезаписать?" "y"; then
+            uci delete "podkop.$PODKOP_PROXY_SECTION"
+        else
+            ok "Используем существующую секцию"
+            return 0
+        fi
+    fi
+
+    local outbound_json
+    outbound_json="{\"type\":\"http\",\"server\":\"$PROXY_SERVER\",\"server_port\":$PROXY_PORT,\"bind_interface\":\"vpn-$IFACE_NAME\"}"
+
+    uci set "podkop.$PODKOP_PROXY_SECTION=section"
+    uci set "podkop.$PODKOP_PROXY_SECTION.connection_type=proxy"
+    uci set "podkop.$PODKOP_PROXY_SECTION.proxy_config_type=outbound"
+    uci set "podkop.$PODKOP_PROXY_SECTION.outbound_json=$outbound_json"
+
+    # Domain Resolver (тот же корп. DNS)
+    if [ -n "$CORP_DNS" ]; then
+        uci set "podkop.$PODKOP_PROXY_SECTION.domain_resolver_enabled=1"
+        uci set "podkop.$PODKOP_PROXY_SECTION.domain_resolver_dns_type=udp"
+        uci set "podkop.$PODKOP_PROXY_SECTION.domain_resolver_dns_server=$CORP_DNS"
+    fi
+
+    # Домены для прокси
+    uci set "podkop.$PODKOP_PROXY_SECTION.user_domain_list_type=text"
+    uci set "podkop.$PODKOP_PROXY_SECTION.user_domains_text=$PROXY_DOMAINS"
+
+    uci commit podkop
+
+    ok "Прокси-секция Podkop создана"
+
+    echo ""
+    info "Конфигурация прокси-секции:"
+    uci show "podkop.$PODKOP_PROXY_SECTION" 2>/dev/null
+
+    echo ""
+    info "Домены из этой секции пойдут через HTTP-прокси $PROXY_SERVER:$PROXY_PORT"
+    info "внутри VPN-тоннеля (bind_interface=vpn-$IFACE_NAME)"
+}
+
+# ============================================================
 # Шаг 7: Создание скрипта для ежедневного использования
 # ============================================================
 create_daily_script() {
@@ -742,6 +820,11 @@ verify() {
         all_ok=0
     fi
 
+    # Проверка прокси-секции (если создавалась)
+    if uci -q get "podkop.$PODKOP_PROXY_SECTION.connection_type" > /dev/null 2>&1; then
+        ok "Прокси-секция Podkop '$PODKOP_PROXY_SECTION' существует"
+    fi
+
     # Проверка Podkop работает
     if pgrep -f sing-box > /dev/null 2>&1; then
         ok "Podkop (sing-box) работает"
@@ -772,7 +855,7 @@ uninstall() {
     echo ""
     printf "  1. Отключение VPN-интерфейса %s\n" "$IFACE_NAME"
     printf "  2. Удаление интерфейса из /etc/config/network\n"
-    printf "  3. Удаление секции '%s' из /etc/config/podkop\n" "$PODKOP_SECTION"
+    printf "  3. Удаление секций '%s' и '%s' из /etc/config/podkop\n" "$PODKOP_SECTION" "$PODKOP_PROXY_SECTION"
     printf "  4. Восстановление vpnc-script из бэкапа\n"
     printf "  5. Удаление скрипта %s\n" "$DAILY_SCRIPT"
     printf "  6. (опционально) Удаление пакетов openconnect\n"
@@ -822,11 +905,20 @@ uninstall_podkop() {
     info "Удаление секции Podkop '$PODKOP_SECTION'..."
     if uci -q get "podkop.$PODKOP_SECTION" > /dev/null 2>&1; then
         uci delete "podkop.$PODKOP_SECTION"
-        uci commit podkop
         ok "Секция '$PODKOP_SECTION' удалена из /etc/config/podkop"
     else
         ok "Секция '$PODKOP_SECTION' не найдена (уже удалена)"
     fi
+
+    info "Удаление прокси-секции '$PODKOP_PROXY_SECTION'..."
+    if uci -q get "podkop.$PODKOP_PROXY_SECTION" > /dev/null 2>&1; then
+        uci delete "podkop.$PODKOP_PROXY_SECTION"
+        ok "Секция '$PODKOP_PROXY_SECTION' удалена из /etc/config/podkop"
+    else
+        ok "Секция '$PODKOP_PROXY_SECTION' не найдена (уже удалена)"
+    fi
+
+    uci commit podkop
 }
 
 uninstall_vpnc_patch() {
@@ -908,7 +1000,7 @@ uninstall_summary() {
     printf "  service podkop status        Podkop работает\n"
     printf "  nslookup fakeip.podkop.fyi   FakeIP работает (с клиента)\n"
     printf "  uci show network             Нет интерфейса %s\n" "$IFACE_NAME"
-    printf "  uci show podkop              Нет секции %s\n" "$PODKOP_SECTION"
+    printf "  uci show podkop              Нет секций %s, %s\n" "$PODKOP_SECTION" "$PODKOP_PROXY_SECTION"
     echo ""
 }
 
@@ -930,6 +1022,9 @@ show_summary() {
     printf "${BOLD}Что проверить в LuCI:${NC}\n"
     printf "  Network → Interfaces → $IFACE_NAME\n"
     printf "  Services → Podkop → секция '$PODKOP_SECTION'\n"
+    if [ -n "$PROXY_DOMAINS" ]; then
+        printf "  Services → Podkop → секция '$PODKOP_PROXY_SECTION' (HTTP-прокси)\n"
+    fi
     echo ""
 
     printf "${BOLD}Если что-то не работает:${NC}\n"
@@ -964,6 +1059,8 @@ main_install() {
     patch_vpnc_script
     setup_interface
     setup_podkop
+    gather_proxy_info
+    setup_podkop_proxy
     create_daily_script
     first_connect
     verify
