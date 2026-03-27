@@ -23,15 +23,15 @@ PODKOP_SECTION="corp"
 PODKOP_PROXY_SECTION="corp_proxy"
 VPNC_SCRIPT="/lib/netifd/vpnc-script"
 AUTH_LOG="/tmp/oc_auth_result.log"
-DAILY_SCRIPT="/usr/bin/corp-vpn"
+DAILY_SCRIPT="/usr/bin/corpvpn"
 
 # Собранные данные (заполняются в процессе)
 VPN_SERVER=""
+VPN_SERVERS_EXTRA=""
 VPN_USER=""
 VPN_PASS=""
 VPN_PASS2=""
 VPN_GROUP=""
-VPN_SERVERHASH=""
 CORP_DNS=""
 CORP_DOMAINS=""
 PROXY_SERVER=""
@@ -210,6 +210,15 @@ gather_vpn_info() {
         *) VPN_SERVER="https://$VPN_SERVER" ;;
     esac
 
+    # --- Extra servers ---
+    echo ""
+    info "Можно добавить дополнительные серверы (те же учётные данные)."
+    info "Первый сервер будет использоваться по умолчанию."
+    if ask_yesno "Добавить дополнительные серверы?" "n"; then
+        info "Введите адреса через пробел. Пример: vpn2.company.com vpn-eu.company.com"
+        VPN_SERVERS_EXTRA=$(ask "Дополнительные серверы")
+    fi
+
     # --- Username ---
     echo ""
     info "Логин — тот же, что вводите в AnyConnect при подключении."
@@ -250,14 +259,6 @@ gather_vpn_info() {
         4) VPN_PASS2="" ;;
     esac
 
-    # --- Server hash ---
-    echo ""
-    info "Хэш сертификата — уникальный отпечаток VPN-сервера для безопасности."
-    info "Если не знаете — ответьте 'n'. Скрипт получит его автоматически на шаге тестирования."
-    if ask_yesno "Знаете SHA256-хэш сертификата VPN-сервера?" "n"; then
-        VPN_SERVERHASH=$(ask "Хэш (формат: pin-sha256:... или sha256:...)")
-    fi
-
     echo ""
     ok "Параметры сохранены."
 }
@@ -269,7 +270,7 @@ test_connection() {
     step "3" "Тестовое подключение"
 
     if ! ask_yesno "Выполнить тест аутентификации?" "y"; then
-        warn "Тест пропущен. Хэш сертификата и корп. DNS нужно будет ввести вручную."
+        warn "Тест пропущен. Корп. DNS нужно будет ввести вручную."
         return 0
     fi
 
@@ -288,7 +289,6 @@ test_connection() {
         --user="$VPN_USER" \
         --useragent="AnyConnect" \
         ${VPN_GROUP:+--authgroup="$VPN_GROUP"} \
-        ${VPN_SERVERHASH:+--servercert="$VPN_SERVERHASH"} \
         "$VPN_SERVER" > "$AUTH_LOG"
 
     local rc=$?
@@ -296,14 +296,6 @@ test_connection() {
 
     if [ $rc -eq 0 ] && grep -q "^COOKIE=" "$AUTH_LOG" 2>/dev/null; then
         ok "Аутентификация успешна!"
-
-        # Извлечь хэш сертификата
-        local hash
-        hash=$(grep "^FINGERPRINT=" "$AUTH_LOG" | head -1 | cut -d= -f2 | tr -d "'" | tr -d '"')
-        if [ -n "$hash" ]; then
-            VPN_SERVERHASH="$hash"
-            info "Хэш сертификата: $hash"
-        fi
     else
         err "Аутентификация не удалась (код: $rc)"
 
@@ -404,10 +396,6 @@ setup_interface() {
 
     if [ -n "$VPN_GROUP" ]; then
         uci set "network.$IFACE_NAME.authgroup=$VPN_GROUP"
-    fi
-
-    if [ -n "$VPN_SERVERHASH" ]; then
-        uci set "network.$IFACE_NAME.serverhash=$VPN_SERVERHASH"
     fi
 
     # Критично: не трогать маршрут по умолчанию и DNS
@@ -594,14 +582,31 @@ create_daily_script() {
 
     info "Создаю $DAILY_SCRIPT..."
 
-    cat > "$DAILY_SCRIPT" << 'SCRIPT_EOF'
+    # Собрать список серверов (первый — по умолчанию)
+    local all_servers="$VPN_SERVER"
+    for s in $VPN_SERVERS_EXTRA; do
+        case "$s" in
+            https://*|http://*) ;;
+            *) s="https://$s" ;;
+        esac
+        all_servers="$all_servers $s"
+    done
+
+    # Часть 1: переменные (с подстановкой значений)
+    cat > "$DAILY_SCRIPT" << SERVERS_EOF
 #!/bin/sh
 #
-# corp-vpn — управление корпоративным VPN
-# Использование: corp-vpn [connect|disconnect|status|restart]
+# corpvpn — управление корпоративным VPN
+# Использование: corpvpn [connect|disconnect|status|servers|addhost|delhost]
 #
 
 IFACE="corp_vpn"
+SELF="$DAILY_SCRIPT"
+VPN_SERVERS="$all_servers"
+SERVERS_EOF
+
+    # Часть 2: логика (без подстановки)
+    cat >> "$DAILY_SCRIPT" << 'SCRIPT_EOF'
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -609,6 +614,14 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
+
+server_count() {
+    local count=0
+    for s in $VPN_SERVERS; do
+        count=$((count + 1))
+    done
+    echo "$count"
+}
 
 get_status() {
     local up
@@ -620,15 +633,89 @@ show_status() {
     local up
     up=$(get_status)
     if [ "$up" = "true" ]; then
-        local ip
+        local ip uri
         ip=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
-        printf "${GREEN}[VPN]${NC} Подключен (IP: %s)\n" "${ip:-N/A}"
+        uri=$(uci -q get "network.$IFACE.uri")
+        printf "${GREEN}[VPN]${NC} Подключен (IP: %s, сервер: %s)\n" "${ip:-N/A}" "${uri:-N/A}"
     else
         printf "${RED}[VPN]${NC} Отключен\n"
     fi
 }
 
+show_servers() {
+    local current_uri i s
+    current_uri=$(uci -q get "network.$IFACE.uri")
+    i=1
+    for s in $VPN_SERVERS; do
+        if [ "$s" = "$current_uri" ]; then
+            printf "  ${GREEN}%d) %s (текущий)${NC}\n" "$i" "$s"
+        else
+            printf "  %d) %s\n" "$i" "$s"
+        fi
+        i=$((i + 1))
+    done
+}
+
+resolve_server() {
+    local requested="$1"
+    if [ -z "$requested" ]; then
+        return
+    fi
+    case "$requested" in
+        [0-9]|[0-9][0-9])
+            local i=1
+            for s in $VPN_SERVERS; do
+                if [ "$i" = "$requested" ]; then
+                    echo "$s"
+                    return
+                fi
+                i=$((i + 1))
+            done
+            ;;
+        *)
+            case "$requested" in
+                https://*|http://*) echo "$requested" ;;
+                *) echo "https://$requested" ;;
+            esac
+            ;;
+    esac
+}
+
+switch_server() {
+    local target="$1"
+    local current_uri
+    current_uri=$(uci -q get "network.$IFACE.uri")
+    if [ "$target" != "$current_uri" ]; then
+        uci set "network.$IFACE.uri=$target"
+        uci commit network
+        printf "${BLUE}[i]${NC} Сервер: %s\n" "$target"
+    fi
+}
+
 do_connect() {
+    local requested="$1"
+
+    # Если сервер не указан и их несколько — показать меню
+    if [ -z "$requested" ] && [ "$(server_count)" -gt 1 ]; then
+        printf "${BOLD}Выберите сервер:${NC}\n"
+        show_servers
+        printf "${BOLD}Номер${NC} [1]: "
+        read -r requested
+        requested="${requested:-1}"
+    fi
+
+    # Переключение сервера, если указан
+    if [ -n "$requested" ]; then
+        local target
+        target=$(resolve_server "$requested")
+        if [ -z "$target" ]; then
+            printf "${RED}[-]${NC} Сервер #%s не найден\n" "$requested"
+            show_servers
+            return 1
+        fi
+        switch_server "$target"
+    fi
+
     local up
     up=$(get_status)
     if [ "$up" = "true" ]; then
@@ -676,26 +763,98 @@ do_disconnect() {
 }
 
 do_restart() {
+    local requested="$1"
     do_disconnect
     sleep 2
-    do_connect
+    # Без аргумента — переподключиться к текущему серверу (без меню)
+    if [ -z "$requested" ]; then
+        requested=$(uci -q get "network.$IFACE.uri")
+    fi
+    do_connect "$requested"
+}
+
+do_addhost() {
+    local host="$1"
+    if [ -z "$host" ]; then
+        printf "${BOLD}Адрес сервера:${NC} "
+        read -r host
+    fi
+    if [ -z "$host" ]; then
+        printf "${RED}[-]${NC} Адрес не указан\n"
+        return 1
+    fi
+    case "$host" in
+        https://*|http://*) ;;
+        *) host="https://$host" ;;
+    esac
+    # Проверка дубликатов
+    for s in $VPN_SERVERS; do
+        if [ "$s" = "$host" ]; then
+            printf "${YELLOW}[!]${NC} Сервер %s уже в списке\n" "$host"
+            return 0
+        fi
+    done
+    local new_servers="$VPN_SERVERS $host"
+    sed -i "s|^VPN_SERVERS=\".*\"|VPN_SERVERS=\"$new_servers\"|" "$SELF"
+    VPN_SERVERS="$new_servers"
+    printf "${GREEN}[+]${NC} Добавлен: %s\n" "$host"
+    show_servers
+}
+
+do_delhost() {
+    local requested="$1"
+    if [ -z "$requested" ]; then
+        show_servers
+        printf "${BOLD}Номер сервера для удаления:${NC} "
+        read -r requested
+    fi
+    if [ -z "$requested" ]; then
+        printf "${RED}[-]${NC} Номер не указан\n"
+        return 1
+    fi
+    if [ "$(server_count)" -le 1 ]; then
+        printf "${RED}[-]${NC} Нельзя удалить единственный сервер\n"
+        return 1
+    fi
+    local target
+    target=$(resolve_server "$requested")
+    if [ -z "$target" ]; then
+        printf "${RED}[-]${NC} Сервер #%s не найден\n" "$requested"
+        return 1
+    fi
+    local new_servers=""
+    for s in $VPN_SERVERS; do
+        if [ "$s" != "$target" ]; then
+            new_servers="${new_servers:+$new_servers }$s"
+        fi
+    done
+    sed -i "s|^VPN_SERVERS=\".*\"|VPN_SERVERS=\"$new_servers\"|" "$SELF"
+    VPN_SERVERS="$new_servers"
+    printf "${GREEN}[+]${NC} Удалён: %s\n" "$target"
+    show_servers
 }
 
 show_help() {
-    printf "${BOLD}Использование:${NC} corp-vpn [команда]\n\n"
-    printf "  ${BOLD}connect${NC}     Подключиться (нужно подтвердить 2FA)\n"
-    printf "  ${BOLD}disconnect${NC}  Отключиться\n"
-    printf "  ${BOLD}status${NC}      Показать статус\n"
-    printf "  ${BOLD}restart${NC}     Переподключиться\n"
-    printf "  ${BOLD}logs${NC}        Показать логи OpenConnect\n"
-    printf "  ${BOLD}help${NC}        Эта справка\n"
+    printf "${BOLD}Использование:${NC} corpvpn [команда]\n\n"
+    printf "  ${BOLD}connect${NC} [N|host]  Подключиться (нужно подтвердить 2FA)\n"
+    printf "  ${BOLD}disconnect${NC}        Отключиться\n"
+    printf "  ${BOLD}status${NC}            Показать статус\n"
+    printf "  ${BOLD}restart${NC} [N|host]  Переподключиться\n"
+    printf "  ${BOLD}servers${NC}           Показать список серверов\n"
+    printf "  ${BOLD}addhost${NC} [host]    Добавить сервер\n"
+    printf "  ${BOLD}delhost${NC} [N]       Удалить сервер\n"
+    printf "  ${BOLD}logs${NC}              Показать логи OpenConnect\n"
+    printf "  ${BOLD}help${NC}              Эта справка\n"
 }
 
 case "${1:-status}" in
-    connect|up|on)       do_connect ;;
+    connect|up|on)       do_connect "$2" ;;
     disconnect|down|off) do_disconnect ;;
     status|st)           show_status ;;
-    restart|re)          do_restart ;;
+    restart|re)          do_restart "$2" ;;
+    servers|srv)         show_servers ;;
+    addhost)             do_addhost "$2" ;;
+    delhost|rmhost)      do_delhost "$2" ;;
     logs|log)            logread | grep -i openconnect | tail -30 ;;
     help|--help|-h)      show_help ;;
     *)
@@ -711,11 +870,14 @@ SCRIPT_EOF
 
     echo ""
     info "Команды:"
-    info "  corp-vpn connect     — подключиться"
-    info "  corp-vpn disconnect  — отключиться"
-    info "  corp-vpn status      — статус"
-    info "  corp-vpn restart     — переподключиться"
-    info "  corp-vpn logs        — логи"
+    info "  corpvpn connect          — подключиться (выбор сервера)"
+    info "  corpvpn disconnect       — отключиться"
+    info "  corpvpn status           — статус"
+    info "  corpvpn servers          — список серверов"
+    info "  corpvpn addhost <host>   — добавить сервер"
+    info "  corpvpn delhost <N>      — удалить сервер"
+    info "  corpvpn restart          — переподключиться"
+    info "  corpvpn logs             — логи"
 }
 
 # ============================================================
@@ -725,7 +887,7 @@ first_connect() {
     step "8" "Первое подключение"
 
     if ! ask_yesno "Подключиться к корп. VPN сейчас?" "y"; then
-        info "Пропущено. Для подключения: corp-vpn connect"
+        info "Пропущено. Для подключения: corpvpn connect"
         return 0
     fi
 
@@ -1013,10 +1175,13 @@ show_summary() {
     printf "${BOLD}${GREEN}══════════════════════════════════════${NC}\n\n"
 
     printf "${BOLD}Ежедневное использование:${NC}\n"
-    printf "  corp-vpn connect      Подключиться (+ 2FA)\n"
-    printf "  corp-vpn disconnect   Отключиться\n"
-    printf "  corp-vpn status       Проверить статус\n"
-    printf "  corp-vpn logs         Посмотреть логи\n"
+    printf "  corpvpn connect       Подключиться (+ 2FA)\n"
+    printf "  corpvpn disconnect    Отключиться\n"
+    printf "  corpvpn status        Проверить статус\n"
+    printf "  corpvpn servers       Список серверов\n"
+    printf "  corpvpn addhost       Добавить сервер\n"
+    printf "  corpvpn delhost       Удалить сервер\n"
+    printf "  corpvpn logs          Посмотреть логи\n"
     echo ""
 
     printf "${BOLD}Что проверить в LuCI:${NC}\n"
@@ -1034,11 +1199,6 @@ show_summary() {
     printf "  ls /tmp/dnsmasq.d/           Проверка DNS (не должно быть openconnect.*)\n"
     echo ""
 
-    if [ -n "$VPN_SERVERHASH" ]; then
-        printf "${BOLD}Хэш сертификата сервера (сохраните):${NC}\n"
-        printf "  %s\n" "$VPN_SERVERHASH"
-        echo ""
-    fi
 }
 
 # ============================================================

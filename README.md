@@ -19,23 +19,13 @@
 ### Вариант 1: Скачать и запустить прямо на роутере
 
 ```bash
-# SSH на роутер
-ssh root@ROUTER
-
-# Скачать скрипт с GitHub и запустить
-wget -O /tmp/setup-corp-vpn.sh https://raw.githubusercontent.com/gundone/openwrt-corp-vpn/main/setup-corp-vpn.sh
-sh /tmp/setup-corp-vpn.sh
+wget -O /tmp/setup-corp-vpn.sh https://raw.githubusercontent.com/gundone/openwrt-corp-vpn/main/setup-corp-vpn.sh && sh /tmp/setup-corp-vpn.sh
 ```
 
 ### Вариант 2: Скопировать с компьютера
 
 ```bash
-# С ПК (Windows/macOS/Linux)
 scp setup-corp-vpn.sh root@ROUTER:/tmp/
-
-ssh root@ROUTER
-sed -i 's/\r$//' /tmp/setup-corp-vpn.sh   # исправить переводы строк, если копировали с Windows
-sh /tmp/setup-corp-vpn.sh
 ```
 
 ### Откат всех изменений
@@ -44,18 +34,21 @@ sh /tmp/setup-corp-vpn.sh
 sh /tmp/setup-corp-vpn.sh uninstall
 ```
 
-Скрипт проведёт через 9 шагов: проверка системы → установка пакетов → ввод параметров VPN → тест 2FA → патч DNS → создание интерфейса → настройка Podkop → создание утилиты `corp-vpn` → первое подключение → верификация.
+Скрипт проведёт через 9 шагов: проверка системы → установка пакетов → ввод параметров VPN → тест 2FA → патч DNS → создание интерфейса → настройка Podkop → создание утилиты `corpvpn` → первое подключение → верификация.
 
 ## После установки
 
-На роутере появляется утилита `corp-vpn`:
+На роутере появляется утилита `corpvpn`:
 
 ```bash
-corp-vpn connect      # подключиться (+ подтвердить push на телефоне)
-corp-vpn disconnect   # отключиться
-corp-vpn status       # проверить статус
-corp-vpn restart      # переподключиться
-corp-vpn logs         # посмотреть логи
+corpvpn connect       # подключиться (выбор сервера, если их несколько)
+corpvpn disconnect    # отключиться
+corpvpn status        # проверить статус
+corpvpn servers       # список серверов
+corpvpn addhost       # добавить сервер
+corpvpn delhost       # удалить сервер
+corpvpn restart       # переподключиться
+corpvpn logs          # посмотреть логи
 ```
 
 ## Требования
