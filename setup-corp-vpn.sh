@@ -24,6 +24,12 @@ PODKOP_PROXY_SECTION="corp_proxy"
 VPNC_SCRIPT="/lib/netifd/vpnc-script"
 AUTH_LOG="/tmp/oc_auth_result.log"
 DAILY_SCRIPT="/usr/bin/corpvpn"
+CORPVPN_UCI="corpvpn"
+CORPVPN_UCI_SECTION="main"
+RPCD_SCRIPT="/usr/libexec/rpcd/luci.corpvpn"
+LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
+LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
+LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
 
 # Собранные данные (заполняются в процессе)
 VPN_SERVER=""
@@ -576,6 +582,34 @@ setup_podkop_proxy() {
 }
 
 # ============================================================
+# Шаг 6c: UCI-конфиг corpvpn (список серверов и настройки)
+# ============================================================
+create_uci_config() {
+    info "Создаю UCI-конфиг /etc/config/$CORPVPN_UCI..."
+
+    [ -f "/etc/config/$CORPVPN_UCI" ] || touch "/etc/config/$CORPVPN_UCI"
+
+    if uci -q get "$CORPVPN_UCI.$CORPVPN_UCI_SECTION" > /dev/null 2>&1; then
+        uci delete "$CORPVPN_UCI.$CORPVPN_UCI_SECTION"
+    fi
+
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION=$CORPVPN_UCI"
+
+    # Добавить серверы
+    uci add_list "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.servers=$VPN_SERVER"
+    for s in $VPN_SERVERS_EXTRA; do
+        case "$s" in
+            https://*|http://*) ;;
+            *) s="https://$s" ;;
+        esac
+        uci add_list "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.servers=$s"
+    done
+
+    uci commit "$CORPVPN_UCI"
+    ok "UCI-конфиг создан"
+}
+
+# ============================================================
 # Шаг 7: Создание скрипта для ежедневного использования
 # ============================================================
 create_daily_script() {
@@ -583,31 +617,18 @@ create_daily_script() {
 
     info "Создаю $DAILY_SCRIPT..."
 
-    # Собрать список серверов (первый — по умолчанию)
-    local all_servers="$VPN_SERVER"
-    for s in $VPN_SERVERS_EXTRA; do
-        case "$s" in
-            https://*|http://*) ;;
-            *) s="https://$s" ;;
-        esac
-        all_servers="$all_servers $s"
-    done
-
-    # Часть 1: переменные (с подстановкой значений)
-    cat > "$DAILY_SCRIPT" << SERVERS_EOF
+    cat > "$DAILY_SCRIPT" << 'SCRIPT_EOF'
 #!/bin/sh
 #
 # corpvpn — управление корпоративным VPN
-# Использование: corpvpn [connect|disconnect|status|servers|addhost|delhost]
+# Использование: corpvpn [connect|disconnect|status|servers|addhost|delhost|schedule|unschedule]
 #
 
 IFACE="corp_vpn"
-SELF="$DAILY_SCRIPT"
-VPN_SERVERS="$all_servers"
-SERVERS_EOF
-
-    # Часть 2: логика (без подстановки)
-    cat >> "$DAILY_SCRIPT" << 'SCRIPT_EOF'
+UCI_CONFIG="corpvpn"
+UCI_SECTION="main"
+CRON_TAG="corpvpn-auto-disconnect"
+CONNECT_TIMEOUT=120
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -615,21 +636,23 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 BOLD='\033[1m'
 NC='\033[0m'
-CRON_TAG="corpvpn-auto-disconnect"
-CONNECT_TIMEOUT=120
+
+get_servers() {
+    local line
+    line=$(uci -q show "$UCI_CONFIG.$UCI_SECTION.servers" 2>/dev/null) || return
+    echo "$line" | sed "s/^${UCI_CONFIG}\.${UCI_SECTION}\.servers=//;s/'//g"
+}
 
 server_count() {
     local count=0
-    for s in $VPN_SERVERS; do
+    for s in $(get_servers); do
         count=$((count + 1))
     done
     echo "$count"
 }
 
 get_status() {
-    local up
-    up=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null)
-    echo "$up"
+    ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@.up' 2>/dev/null
 }
 
 show_status() {
@@ -643,15 +666,10 @@ show_status() {
     else
         printf "${RED}[VPN]${NC} Отключен\n"
     fi
-    if [ -f /etc/crontabs/root ]; then
-        local sched
-        sched=$(grep "$CRON_TAG" /etc/crontabs/root 2>/dev/null | head -1)
-        if [ -n "$sched" ]; then
-            local cron_min cron_hour
-            cron_min=$(echo "$sched" | awk '{print $1}')
-            cron_hour=$(echo "$sched" | awk '{print $2}')
-            printf "${BLUE}[i]${NC} Автоотключение: %02d:%02d\n" "$cron_hour" "$cron_min"
-        fi
+    local sched_time
+    sched_time=$(uci -q get "$UCI_CONFIG.$UCI_SECTION.disconnect_time")
+    if [ -n "$sched_time" ]; then
+        printf "${BLUE}[i]${NC} Автоотключение: %s\n" "$sched_time"
     fi
 }
 
@@ -659,7 +677,7 @@ show_servers() {
     local current_uri i s
     current_uri=$(uci -q get "network.$IFACE.uri")
     i=1
-    for s in $VPN_SERVERS; do
+    for s in $(get_servers); do
         if [ "$s" = "$current_uri" ]; then
             printf "  ${GREEN}%d) %s (текущий)${NC}\n" "$i" "$s"
         else
@@ -677,7 +695,7 @@ resolve_server() {
     case "$requested" in
         [0-9]|[0-9][0-9])
             local i=1
-            for s in $VPN_SERVERS; do
+            for s in $(get_servers); do
                 if [ "$i" = "$requested" ]; then
                     echo "$s"
                     return
@@ -802,15 +820,14 @@ do_addhost() {
         *) host="https://$host" ;;
     esac
     # Проверка дубликатов
-    for s in $VPN_SERVERS; do
+    for s in $(get_servers); do
         if [ "$s" = "$host" ]; then
             printf "${YELLOW}[!]${NC} Сервер %s уже в списке\n" "$host"
             return 0
         fi
     done
-    local new_servers="$VPN_SERVERS $host"
-    sed -i "s|^VPN_SERVERS=\".*\"|VPN_SERVERS=\"$new_servers\"|" "$SELF"
-    VPN_SERVERS="$new_servers"
+    uci add_list "$UCI_CONFIG.$UCI_SECTION.servers=$host"
+    uci commit "$UCI_CONFIG"
     printf "${GREEN}[+]${NC} Добавлен: %s\n" "$host"
     show_servers
 }
@@ -836,14 +853,8 @@ do_delhost() {
         printf "${RED}[-]${NC} Сервер #%s не найден\n" "$requested"
         return 1
     fi
-    local new_servers=""
-    for s in $VPN_SERVERS; do
-        if [ "$s" != "$target" ]; then
-            new_servers="${new_servers:+$new_servers }$s"
-        fi
-    done
-    sed -i "s|^VPN_SERVERS=\".*\"|VPN_SERVERS=\"$new_servers\"|" "$SELF"
-    VPN_SERVERS="$new_servers"
+    uci del_list "$UCI_CONFIG.$UCI_SECTION.servers=$target"
+    uci commit "$UCI_CONFIG"
     printf "${GREEN}[+]${NC} Удалён: %s\n" "$target"
     show_servers
 }
@@ -859,6 +870,8 @@ do_schedule() {
     esac
     local hour="${time%%:*}"
     local minute="${time##*:}"
+    uci set "$UCI_CONFIG.$UCI_SECTION.disconnect_time=$time"
+    uci commit "$UCI_CONFIG"
     if [ -f /etc/crontabs/root ]; then
         sed -i "/$CRON_TAG/d" /etc/crontabs/root
     fi
@@ -868,13 +881,13 @@ do_schedule() {
 }
 
 do_unschedule() {
+    uci -q delete "$UCI_CONFIG.$UCI_SECTION.disconnect_time"
+    uci commit "$UCI_CONFIG"
     if [ -f /etc/crontabs/root ] && grep -q "$CRON_TAG" /etc/crontabs/root; then
         sed -i "/$CRON_TAG/d" /etc/crontabs/root
         /etc/init.d/cron restart 2>/dev/null
-        printf "${GREEN}[+]${NC} Автоотключение отменено\n"
-    else
-        printf "${YELLOW}[!]${NC} Автоотключение не настроено\n"
     fi
+    printf "${GREEN}[+]${NC} Автоотключение отменено\n"
 }
 
 show_help() {
@@ -957,7 +970,11 @@ setup_auto_disconnect() {
     local hour="${AUTO_DISCONNECT_TIME%%:*}"
     local minute="${AUTO_DISCONNECT_TIME##*:}"
 
-    # Удалить существующую запись, если есть
+    # Сохранить в UCI
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.disconnect_time=$AUTO_DISCONNECT_TIME"
+    uci commit "$CORPVPN_UCI"
+
+    # Обновить cron
     if [ -f /etc/crontabs/root ]; then
         sed -i "/corpvpn-auto-disconnect/d" /etc/crontabs/root
     fi
@@ -966,6 +983,381 @@ setup_auto_disconnect() {
     /etc/init.d/cron restart 2>/dev/null
 
     ok "Автоотключение: каждый день в $AUTO_DISCONNECT_TIME"
+}
+
+# ============================================================
+# Шаг 7c: LuCI-приложение (веб-интерфейс управления)
+# ============================================================
+deploy_luci_app() {
+    step "7c" "Установка LuCI-приложения"
+
+    info "Создаю страницу управления в LuCI (Services → Corp VPN)..."
+
+    # --- Меню ---
+    mkdir -p "$(dirname "$LUCI_MENU")"
+    cat > "$LUCI_MENU" << 'MENU_EOF'
+{
+    "admin/services/corpvpn": {
+        "title": "Corp VPN",
+        "order": 90,
+        "action": {
+            "type": "view",
+            "path": "corpvpn"
+        },
+        "depends": {
+            "acl": ["luci-app-corpvpn"],
+            "uci": { "corpvpn": true }
+        }
+    }
+}
+MENU_EOF
+    ok "Меню создано"
+
+    # --- ACL ---
+    mkdir -p "$(dirname "$LUCI_ACL")"
+    cat > "$LUCI_ACL" << 'ACL_EOF'
+{
+    "luci-app-corpvpn": {
+        "description": "Grant access to Corp VPN management",
+        "read": {
+            "ubus": {
+                "luci.corpvpn": ["getStatus"],
+                "uci": ["corpvpn", "network"]
+            },
+            "uci": ["corpvpn", "network"]
+        },
+        "write": {
+            "ubus": {
+                "luci.corpvpn": ["connect", "disconnect", "restartPodkop", "setSchedule", "removeSchedule"],
+                "uci": ["corpvpn", "network"]
+            },
+            "uci": ["corpvpn", "network"]
+        }
+    }
+}
+ACL_EOF
+    ok "ACL создан"
+
+    # --- rpcd-плагин (бэкенд) ---
+    mkdir -p "$(dirname "$RPCD_SCRIPT")"
+    cat > "$RPCD_SCRIPT" << 'RPCD_EOF'
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+
+case "$1" in
+    list)
+        echo '{"getStatus":{},"connect":{"server":"str"},"disconnect":{},"restartPodkop":{},"setSchedule":{"time":"str"},"removeSchedule":{}}'
+        ;;
+    call)
+        case "$2" in
+            getStatus)
+                local json up ip uri
+                json=$(ifstatus corp_vpn 2>/dev/null)
+                up=$(echo "$json" | jsonfilter -e '@.up' 2>/dev/null)
+                ip=$(echo "$json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+                uri=$(uci -q get network.corp_vpn.uri)
+                json_init
+                if [ "$up" = "true" ]; then
+                    json_add_boolean "up" 1
+                else
+                    json_add_boolean "up" 0
+                fi
+                json_add_string "ip" "${ip:-}"
+                json_add_string "server" "${uri:-}"
+                json_dump
+                ;;
+            connect)
+                read -r input
+                json_load "$input"
+                json_get_var server server
+                if [ -n "$server" ]; then
+                    uci set "network.corp_vpn.uri=$server"
+                    uci commit network
+                fi
+                ifup corp_vpn 2>/dev/null
+                json_init
+                json_add_boolean "ok" 1
+                json_dump
+                ;;
+            disconnect)
+                ifdown corp_vpn 2>/dev/null
+                json_init
+                json_add_boolean "ok" 1
+                json_dump
+                ;;
+            restartPodkop)
+                service podkop restart > /dev/null 2>&1
+                json_init
+                json_add_boolean "ok" 1
+                json_dump
+                ;;
+            setSchedule)
+                read -r input
+                json_load "$input"
+                json_get_var time time
+                if [ -n "$time" ]; then
+                    /usr/bin/corpvpn schedule "$time" > /dev/null 2>&1
+                fi
+                json_init
+                json_add_boolean "ok" 1
+                json_dump
+                ;;
+            removeSchedule)
+                /usr/bin/corpvpn unschedule > /dev/null 2>&1
+                json_init
+                json_add_boolean "ok" 1
+                json_dump
+                ;;
+        esac
+        ;;
+esac
+RPCD_EOF
+    chmod +x "$RPCD_SCRIPT"
+    ok "rpcd-плагин создан"
+
+    # --- LuCI View (JS) ---
+    mkdir -p "$(dirname "$LUCI_VIEW")"
+    cat > "$LUCI_VIEW" << 'VIEW_EOF'
+'use strict';
+'require view';
+'require dom';
+'require ui';
+'require uci';
+'require rpc';
+'require poll';
+
+var callGetStatus = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'getStatus',
+    expect: { '': {} }
+});
+
+var callConnect = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'connect',
+    params: ['server'],
+    expect: { '': {} }
+});
+
+var callDisconnect = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'disconnect',
+    expect: { '': {} }
+});
+
+var callRestartPodkop = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'restartPodkop',
+    expect: { '': {} }
+});
+
+var callSetSchedule = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'setSchedule',
+    params: ['time'],
+    expect: { '': {} }
+});
+
+var callRemoveSchedule = rpc.declare({
+    object: 'luci.corpvpn',
+    method: 'removeSchedule',
+    expect: { '': {} }
+});
+
+function statusDot(up) {
+    return E('span', { style: 'display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;background:' + (up ? '#4caf50' : '#f44336') });
+}
+
+return view.extend({
+    load: function() {
+        return Promise.all([
+            uci.load('corpvpn'),
+            uci.load('network'),
+            callGetStatus()
+        ]);
+    },
+
+    pollStatus: function() {
+        return callGetStatus().then(function(s) {
+            var dot = document.getElementById('vpn-dot');
+            var txt = document.getElementById('vpn-status-text');
+            var ipEl = document.getElementById('vpn-ip');
+            var srvEl = document.getElementById('vpn-srv');
+            if (!dot) return;
+            var up = s && s.up;
+            dot.style.background = up ? '#4caf50' : '#f44336';
+            txt.textContent = up ? 'Подключен' : 'Отключен';
+            ipEl.textContent = up ? 'IP: ' + (s.ip || 'N/A') : '';
+            srvEl.textContent = 'Сервер: ' + (s.server || 'N/A');
+        });
+    },
+
+    render: function(data) {
+        var status = data[2] || {};
+        var servers = uci.get('corpvpn', 'main', 'servers') || [];
+        var disconnectTime = uci.get('corpvpn', 'main', 'disconnect_time') || '';
+        var isUp = status.up || false;
+        var currentUri = uci.get('network', 'corp_vpn', 'uri') || '';
+        var self = this;
+
+        if (typeof servers === 'string') servers = [servers];
+
+        /* ── Статус ── */
+        var statusBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Статус'),
+            E('div', { style: 'padding:8px 0' }, [
+                E('div', { style: 'display:flex;align-items:center;margin-bottom:4px' }, [
+                    E('span', { id: 'vpn-dot', style: 'display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;background:' + (isUp ? '#4caf50' : '#f44336') }),
+                    E('strong', { id: 'vpn-status-text' }, isUp ? 'Подключен' : 'Отключен')
+                ]),
+                E('div', { id: 'vpn-ip' }, isUp ? 'IP: ' + (status.ip || 'N/A') : ''),
+                E('div', { id: 'vpn-srv' }, 'Сервер: ' + (status.server || 'N/A'))
+            ])
+        ]);
+
+        /* ── Подключение ── */
+        var select = E('select', { id: 'vpn-server-select', 'class': 'cbi-input-select', style: 'min-width:300px' });
+        servers.forEach(function(srv) {
+            select.appendChild(E('option', { value: srv, selected: srv === currentUri ? '' : null }, srv));
+        });
+
+        var connBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Подключение'),
+            E('div', { style: 'margin-bottom:10px' }, [
+                E('label', { style: 'display:block;margin-bottom:4px;font-weight:bold' }, 'Сервер:'),
+                select
+            ]),
+            E('div', { style: 'display:flex;gap:6px;flex-wrap:wrap' }, [
+                E('button', {
+                    'class': 'cbi-button cbi-button-apply',
+                    click: ui.createHandlerFn(this, function() {
+                        var srv = document.getElementById('vpn-server-select').value;
+                        return callConnect(srv).then(function() {
+                            ui.addNotification(null, E('p', 'Подключение... Подтвердите 2FA на телефоне!'), 'info');
+                        });
+                    })
+                }, 'Подключиться'),
+                E('button', {
+                    'class': 'cbi-button cbi-button-reset',
+                    click: ui.createHandlerFn(this, function() {
+                        return callDisconnect().then(function() {
+                            ui.addNotification(null, E('p', 'VPN отключен'), 'success');
+                        });
+                    })
+                }, 'Отключиться'),
+                E('button', {
+                    'class': 'cbi-button cbi-button-action',
+                    click: ui.createHandlerFn(this, function() {
+                        return callRestartPodkop().then(function() {
+                            ui.addNotification(null, E('p', 'Podkop перезапущен'), 'success');
+                        });
+                    })
+                }, 'Перезапустить Podkop')
+            ])
+        ]);
+
+        /* ── Серверы ── */
+        var serverList = E('div', {});
+        servers.forEach(function(srv) {
+            serverList.appendChild(E('div', { style: 'display:flex;align-items:center;padding:4px 0;gap:8px' }, [
+                E('span', { style: 'flex:1' }, srv),
+                E('button', {
+                    'class': 'cbi-button cbi-button-remove',
+                    'data-server': srv,
+                    click: ui.createHandlerFn(self, function(ev) {
+                        var target = ev.currentTarget.getAttribute('data-server');
+                        var cur = uci.get('corpvpn', 'main', 'servers') || [];
+                        if (typeof cur === 'string') cur = [cur];
+                        if (cur.length <= 1) {
+                            ui.addNotification(null, E('p', 'Нельзя удалить единственный сервер'), 'warning');
+                            return;
+                        }
+                        uci.set('corpvpn', 'main', 'servers', cur.filter(function(s) { return s !== target; }));
+                        return uci.save().then(function() { return uci.apply(true); }).then(function() { location.reload(); });
+                    })
+                }, 'Удалить')
+            ]));
+        });
+
+        var serversBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Серверы'),
+            serverList,
+            E('div', { style: 'display:flex;gap:8px;margin-top:8px;align-items:center' }, [
+                E('input', { id: 'new-server-input', type: 'text', 'class': 'cbi-input-text', placeholder: 'vpn.company.com', style: 'flex:1' }),
+                E('button', {
+                    'class': 'cbi-button cbi-button-add',
+                    click: ui.createHandlerFn(this, function() {
+                        var val = document.getElementById('new-server-input').value.trim();
+                        if (!val) return;
+                        if (!/^https?:\/\//.test(val)) val = 'https://' + val;
+                        var cur = uci.get('corpvpn', 'main', 'servers') || [];
+                        if (typeof cur === 'string') cur = [cur];
+                        if (cur.indexOf(val) !== -1) {
+                            ui.addNotification(null, E('p', 'Сервер уже в списке'), 'warning');
+                            return;
+                        }
+                        cur.push(val);
+                        uci.set('corpvpn', 'main', 'servers', cur);
+                        return uci.save().then(function() { return uci.apply(true); }).then(function() { location.reload(); });
+                    })
+                }, 'Добавить')
+            ])
+        ]);
+
+        /* ── Автоотключение ── */
+        var scheduleBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Автоотключение'),
+            E('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, [
+                E('label', {}, 'Время:'),
+                E('input', { id: 'disconnect-time', type: 'time', 'class': 'cbi-input-text', value: disconnectTime, style: 'width:130px' }),
+                E('button', {
+                    'class': 'cbi-button cbi-button-apply',
+                    click: ui.createHandlerFn(this, function() {
+                        var t = document.getElementById('disconnect-time').value;
+                        if (!t) return;
+                        return callSetSchedule(t).then(function() {
+                            uci.set('corpvpn', 'main', 'disconnect_time', t);
+                            ui.addNotification(null, E('p', 'Автоотключение: каждый день в ' + t), 'success');
+                        });
+                    })
+                }, 'Сохранить'),
+                E('button', {
+                    'class': 'cbi-button cbi-button-remove',
+                    click: ui.createHandlerFn(this, function() {
+                        return callRemoveSchedule().then(function() {
+                            uci.unset('corpvpn', 'main', 'disconnect_time');
+                            document.getElementById('disconnect-time').value = '';
+                            ui.addNotification(null, E('p', 'Автоотключение отменено'), 'success');
+                        });
+                    })
+                }, 'Отключить')
+            ]),
+            disconnectTime
+                ? E('p', { style: 'color:#4caf50;margin-top:6px' }, 'Активно: отключение каждый день в ' + disconnectTime)
+                : E('p', { style: 'color:#999;margin-top:6px' }, 'Не настроено')
+        ]);
+
+        /* ── Автообновление статуса ── */
+        poll.add(L.bind(this.pollStatus, this), 5);
+
+        return E('div', {}, [
+            E('h2', {}, 'Corp VPN'),
+            statusBox,
+            connBox,
+            serversBox,
+            scheduleBox
+        ]);
+    }
+});
+VIEW_EOF
+    ok "LuCI View создан"
+
+    # Перезапуск rpcd для загрузки нового плагина
+    info "Перезапуск rpcd..."
+    service rpcd restart 2>/dev/null
+    sleep 1
+    ok "LuCI-приложение установлено: Services → Corp VPN"
 }
 
 # ============================================================
@@ -1076,6 +1468,14 @@ verify() {
         ok "Прокси-секция Podkop '$PODKOP_PROXY_SECTION' существует"
     fi
 
+    # Проверка LuCI-приложения
+    if [ -f "$LUCI_VIEW" ] && [ -f "$RPCD_SCRIPT" ]; then
+        ok "LuCI-приложение установлено"
+    else
+        warn "LuCI-приложение не найдено"
+        all_ok=0
+    fi
+
     # Проверка Podkop работает
     if pgrep -f sing-box > /dev/null 2>&1; then
         ok "Podkop (sing-box) работает"
@@ -1110,7 +1510,8 @@ uninstall() {
     printf "  4. Восстановление vpnc-script из бэкапа\n"
     printf "  5. Удаление скрипта %s\n" "$DAILY_SCRIPT"
     printf "  6. Удаление автоотключения из cron\n"
-    printf "  7. (опционально) Удаление пакетов openconnect\n"
+    printf "  7. Удаление LuCI-приложения и UCI-конфига\n"
+    printf "  8. (опционально) Удаление пакетов openconnect\n"
     echo ""
 
     if ! ask_yesno "Продолжить откат?" "n"; then
@@ -1125,6 +1526,8 @@ uninstall() {
     uninstall_vpnc_patch
     uninstall_daily_script
     uninstall_cron
+    uninstall_luci_app
+    uninstall_uci_config
     uninstall_packages
     uninstall_restart_services
     uninstall_summary
@@ -1222,6 +1625,22 @@ uninstall_cron() {
     fi
 }
 
+uninstall_luci_app() {
+    info "Удаление LuCI-приложения..."
+    rm -f "$LUCI_VIEW" "$LUCI_MENU" "$LUCI_ACL" "$RPCD_SCRIPT"
+    ok "LuCI-приложение удалено"
+}
+
+uninstall_uci_config() {
+    info "Удаление UCI-конфига /etc/config/$CORPVPN_UCI..."
+    if [ -f "/etc/config/$CORPVPN_UCI" ]; then
+        rm -f "/etc/config/$CORPVPN_UCI"
+        ok "UCI-конфиг удалён"
+    else
+        ok "UCI-конфиг не найден (уже удалён)"
+    fi
+}
+
 uninstall_packages() {
     echo ""
     if ! ask_yesno "Удалить пакеты openconnect и luci-proto-openconnect?" "n"; then
@@ -1295,11 +1714,12 @@ show_summary() {
     fi
     echo ""
 
-    printf "${BOLD}Что проверить в LuCI:${NC}\n"
-    printf "  Network → Interfaces → $IFACE_NAME\n"
-    printf "  Services → Podkop → секция '$PODKOP_SECTION'\n"
+    printf "${BOLD}Веб-интерфейс (LuCI):${NC}\n"
+    printf "  Services → Corp VPN          Управление VPN из браузера\n"
+    printf "  Network → Interfaces → %s\n" "$IFACE_NAME"
+    printf "  Services → Podkop → секция '%s'\n" "$PODKOP_SECTION"
     if [ -n "$PROXY_DOMAINS" ]; then
-        printf "  Services → Podkop → секция '$PODKOP_PROXY_SECTION' (HTTP-прокси)\n"
+        printf "  Services → Podkop → секция '%s' (HTTP-прокси)\n" "$PODKOP_PROXY_SECTION"
     fi
     echo ""
 
@@ -1332,8 +1752,10 @@ main_install() {
     setup_podkop
     gather_proxy_info
     setup_podkop_proxy
+    create_uci_config
     create_daily_script
     setup_auto_disconnect
+    deploy_luci_app
     first_connect
     verify
     show_summary
