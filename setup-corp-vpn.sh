@@ -1052,19 +1052,25 @@ case "$1" in
     call)
         case "$2" in
             getStatus)
-                local json up ip uri
-                json=$(ifstatus corp_vpn 2>/dev/null)
-                up=$(echo "$json" | jsonfilter -e '@.up' 2>/dev/null)
-                ip=$(echo "$json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
-                uri=$(uci -q get network.corp_vpn.uri)
+                _json=$(ifstatus corp_vpn 2>/dev/null)
+                _up=$(echo "$_json" | jsonfilter -e '@.up' 2>/dev/null)
+                _pending=$(echo "$_json" | jsonfilter -e '@.pending' 2>/dev/null)
+                _ip=$(echo "$_json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+                _uri=$(uci -q get network.corp_vpn.uri)
+                _oc_running=$(pgrep -x openconnect > /dev/null 2>&1 && echo 1 || echo 0)
                 json_init
-                if [ "$up" = "true" ]; then
+                if [ "$_up" = "true" ]; then
                     json_add_boolean "up" 1
+                    json_add_boolean "pending" 0
+                elif [ "$_pending" = "true" ] || [ "$_oc_running" = "1" ]; then
+                    json_add_boolean "up" 0
+                    json_add_boolean "pending" 1
                 else
                     json_add_boolean "up" 0
+                    json_add_boolean "pending" 0
                 fi
-                json_add_string "ip" "${ip:-}"
-                json_add_string "server" "${uri:-}"
+                json_add_string "ip" "${_ip:-}"
+                json_add_string "server" "${_uri:-}"
                 json_dump
                 ;;
             connect)
@@ -1129,44 +1135,46 @@ RPCD_EOF
 
 var callGetStatus = rpc.declare({
     object: 'luci.corpvpn',
-    method: 'getStatus',
-    expect: { '': {} }
+    method: 'getStatus'
 });
 
 var callConnect = rpc.declare({
     object: 'luci.corpvpn',
     method: 'connect',
-    params: ['server'],
-    expect: { '': {} }
+    params: ['server']
 });
 
 var callDisconnect = rpc.declare({
     object: 'luci.corpvpn',
-    method: 'disconnect',
-    expect: { '': {} }
+    method: 'disconnect'
 });
 
 var callRestartPodkop = rpc.declare({
     object: 'luci.corpvpn',
-    method: 'restartPodkop',
-    expect: { '': {} }
+    method: 'restartPodkop'
 });
 
 var callSetSchedule = rpc.declare({
     object: 'luci.corpvpn',
     method: 'setSchedule',
-    params: ['time'],
-    expect: { '': {} }
+    params: ['time']
 });
 
 var callRemoveSchedule = rpc.declare({
     object: 'luci.corpvpn',
-    method: 'removeSchedule',
-    expect: { '': {} }
+    method: 'removeSchedule'
 });
 
-function statusDot(up) {
-    return E('span', { style: 'display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;background:' + (up ? '#4caf50' : '#f44336') });
+function statusColor(s) {
+    if (s && s.up) return '#4caf50';
+    if (s && s.pending) return '#ff9800';
+    return '#f44336';
+}
+
+function statusText(s) {
+    if (s && s.up) return 'Подключен';
+    if (s && s.pending) return 'Подключение...';
+    return 'Отключен';
 }
 
 return view.extend({
@@ -1185,11 +1193,10 @@ return view.extend({
             var ipEl = document.getElementById('vpn-ip');
             var srvEl = document.getElementById('vpn-srv');
             if (!dot) return;
-            var up = s && s.up;
-            dot.style.background = up ? '#4caf50' : '#f44336';
-            txt.textContent = up ? 'Подключен' : 'Отключен';
-            ipEl.textContent = up ? 'IP: ' + (s.ip || 'N/A') : '';
-            srvEl.textContent = 'Сервер: ' + (s.server || 'N/A');
+            dot.style.background = statusColor(s);
+            txt.textContent = statusText(s);
+            ipEl.textContent = (s && s.up) ? 'IP: ' + (s.ip || 'N/A') : '';
+            srvEl.textContent = 'Сервер: ' + ((s && s.server) || 'N/A');
         });
     },
 
@@ -1197,7 +1204,6 @@ return view.extend({
         var status = data[2] || {};
         var servers = uci.get('corpvpn', 'main', 'servers') || [];
         var disconnectTime = uci.get('corpvpn', 'main', 'disconnect_time') || '';
-        var isUp = status.up || false;
         var currentUri = uci.get('network', 'corp_vpn', 'uri') || '';
         var self = this;
 
@@ -1208,10 +1214,10 @@ return view.extend({
             E('h3', {}, 'Статус'),
             E('div', { style: 'padding:8px 0' }, [
                 E('div', { style: 'display:flex;align-items:center;margin-bottom:4px' }, [
-                    E('span', { id: 'vpn-dot', style: 'display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;background:' + (isUp ? '#4caf50' : '#f44336') }),
-                    E('strong', { id: 'vpn-status-text' }, isUp ? 'Подключен' : 'Отключен')
+                    E('span', { id: 'vpn-dot', style: 'display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px;background:' + statusColor(status) }),
+                    E('strong', { id: 'vpn-status-text' }, statusText(status))
                 ]),
-                E('div', { id: 'vpn-ip' }, isUp ? 'IP: ' + (status.ip || 'N/A') : ''),
+                E('div', { id: 'vpn-ip' }, status.up ? 'IP: ' + (status.ip || 'N/A') : ''),
                 E('div', { id: 'vpn-srv' }, 'Сервер: ' + (status.server || 'N/A'))
             ])
         ]);
@@ -1739,7 +1745,7 @@ main_install() {
     printf "${BOLD}${CYAN}"
     printf "╔══════════════════════════════════════════╗\n"
     printf "║  OpenConnect + Podkop Setup Wizard       ║\n"
-    printf "║  Корпоративный VPN на OpenWrt             ║\n"
+    printf "║  Корпоративный VPN на OpenWrt            ║\n"
     printf "╚══════════════════════════════════════════╝\n"
     printf "${NC}\n"
 
