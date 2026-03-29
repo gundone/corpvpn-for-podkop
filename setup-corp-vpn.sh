@@ -1162,7 +1162,7 @@ case "$1" in
                 ;;
             checkVersion)
                 _current=$(uci -q get corpvpn.main.version)
-                _latest=$(wget -qO- "https://raw.githubusercontent.com/gundone/corpvpn-for-podkop/main/VERSION" 2>/dev/null | head -1 | tr -d '[:space:]')
+                _latest=$(wget -qO- "https://raw.githubusercontent.com/gundone/corpvpn-for-podkop/main/VERSION?t=$(date +%s)" 2>/dev/null | head -1 | tr -d '[:space:]')
                 json_init
                 json_add_string "current" "${_current:-unknown}"
                 json_add_string "latest" "${_latest:-unknown}"
