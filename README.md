@@ -19,7 +19,7 @@
 ### 1. Скачать скрипт на роутер
 
 ```bash
-wget -O /tmp/setup-corp-vpn.sh https://raw.githubusercontent.com/gundone/openwrt-corp-vpn/main/setup-corp-vpn.sh
+wget -O /tmp/setup-corp-vpn.sh https://raw.githubusercontent.com/gundone/corpvpn-for-podkop/main/setup-corp-vpn.sh
 ```
 
 Или скопировать с компьютера:
