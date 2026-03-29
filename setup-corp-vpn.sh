@@ -30,7 +30,7 @@ RPCD_SCRIPT="/usr/libexec/rpcd/luci.corpvpn"
 LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
-CORPVPN_VERSION="1.0.0"
+CORPVPN_VERSION="1.1.0"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
@@ -581,6 +581,39 @@ setup_podkop_proxy() {
     echo ""
     info "Домены из этой секции пойдут через HTTP-прокси $PROXY_SERVER:$PROXY_PORT"
     info "внутри VPN-тоннеля (bind_interface=vpn-$IFACE_NAME)"
+}
+
+# ============================================================
+# Шаг 6d: Приоритет секций Podkop
+# ============================================================
+reorder_podkop_sections() {
+    info "Настройка приоритета секций Podkop..."
+
+    # Позиция 0 — settings, начинаем с 1
+    local pos=1
+
+    # 1. Exclusion-секции первыми
+    for s in $(uci -q show podkop 2>/dev/null | grep "\.connection_type='exclusion'" | \
+               sed "s/podkop\.//;s/\.connection_type.*//"); do
+        uci reorder "podkop.$s=$pos"
+        pos=$((pos + 1))
+    done
+
+    # 2. corp_proxy
+    if uci -q get "podkop.$PODKOP_PROXY_SECTION" > /dev/null 2>&1; then
+        uci reorder "podkop.$PODKOP_PROXY_SECTION=$pos"
+        pos=$((pos + 1))
+    fi
+
+    # 3. corp
+    if uci -q get "podkop.$PODKOP_SECTION" > /dev/null 2>&1; then
+        uci reorder "podkop.$PODKOP_SECTION=$pos"
+        pos=$((pos + 1))
+    fi
+
+    # 4. main и остальные секции остаются после
+    uci commit podkop
+    ok "Приоритет: exclusion → corp_proxy → corp → main"
 }
 
 # ============================================================
@@ -2053,6 +2086,7 @@ main_upgrade() {
     fi
 
     create_daily_script
+    reorder_podkop_sections
 
     # Синхронизация автоотключения (UCI + cron)
     if [ -n "$AUTO_DISCONNECT_TIME" ]; then
@@ -2129,6 +2163,7 @@ main_install() {
     setup_podkop
     gather_proxy_info
     setup_podkop_proxy
+    reorder_podkop_sections
     create_uci_config
     create_daily_script
     setup_auto_disconnect
