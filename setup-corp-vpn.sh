@@ -1856,6 +1856,30 @@ main_install() {
     printf "╚══════════════════════════════════════════╝\n"
     printf "${NC}\n"
 
+    # Проверка: если уже установлен — предложить upgrade
+    if uci -q get "network.$IFACE_NAME.uri" > /dev/null 2>&1; then
+        warn "Обнаружена существующая установка ($IFACE_NAME)."
+        echo ""
+        printf "  ${BOLD}1)${NC} Обновить (upgrade) — обновить скрипты, сохранив параметры\n"
+        printf "  ${BOLD}2)${NC} Переустановить (clean install) — настроить всё заново\n"
+        echo ""
+        local install_choice
+        install_choice=$(ask "Выберите" "1")
+        case "$install_choice" in
+            1)
+                main_upgrade
+                return 0
+                ;;
+            2)
+                warn "Будет выполнена полная переустановка."
+                if ! ask_yesno "Продолжить?" "y"; then
+                    info "Отменено."
+                    exit 0
+                fi
+                ;;
+        esac
+    fi
+
     check_prerequisites
     install_packages
     gather_vpn_info
