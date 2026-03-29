@@ -30,7 +30,7 @@ RPCD_SCRIPT="/usr/libexec/rpcd/luci.corpvpn"
 LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
-CORPVPN_VERSION="1.1.0"
+CORPVPN_VERSION="1.1.1"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
