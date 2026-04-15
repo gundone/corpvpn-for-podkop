@@ -30,7 +30,8 @@ RPCD_SCRIPT="/usr/libexec/rpcd/luci.corpvpn"
 LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
-CORPVPN_VERSION="1.1.2"
+HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-corpvpn-no-retry"
+CORPVPN_VERSION="1.2.0"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
@@ -422,6 +423,35 @@ setup_interface() {
 }
 
 # ============================================================
+# Hotplug: запрет авто-реконнекта netifd
+# ============================================================
+install_hotplug_no_retry() {
+    info "Установка hotplug-скрипта (запрет авто-реконнекта)..."
+
+    mkdir -p "$(dirname "$HOTPLUG_SCRIPT")"
+    cat > "$HOTPLUG_SCRIPT" << 'HOTPLUG_EOF'
+#!/bin/sh
+# Prevent netifd from auto-retrying corp VPN connection
+# unless auto_reconnect is explicitly enabled by the user.
+# Without this, failed auth (e.g. unanswered 2FA push) triggers
+# an infinite reconnect loop that floods the VPN server.
+
+[ "$INTERFACE" = "corp_vpn" ] || exit 0
+[ "$ACTION" = "ifdown" ] || exit 0
+
+# If auto-reconnect is enabled in settings — let netifd retry
+_ar=$(uci -q get corpvpn.main.auto_reconnect)
+[ "$_ar" = "1" ] && exit 0
+
+# Interface went down (connection dropped or auth failed).
+# Tell netifd to stop — user can reconnect manually via 'corpvpn connect'.
+ifdown corp_vpn 2>/dev/null
+HOTPLUG_EOF
+    chmod +x "$HOTPLUG_SCRIPT"
+    ok "Hotplug-скрипт установлен: $HOTPLUG_SCRIPT"
+}
+
+# ============================================================
 # Шаг 6: Настройка Podkop
 # ============================================================
 gather_podkop_info() {
@@ -638,6 +668,7 @@ create_uci_config() {
         uci add_list "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.servers=$s"
     done
 
+    uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.auto_reconnect=0"
     uci set "$CORPVPN_UCI.$CORPVPN_UCI_SECTION.version=$CORPVPN_VERSION"
     uci commit "$CORPVPN_UCI"
     ok "UCI-конфиг создан (v$CORPVPN_VERSION)"
@@ -831,7 +862,7 @@ do_connect() {
     printf "${YELLOW}[!]${NC} Подтвердите 2FA на телефоне!\n"
     ifup "$IFACE"
 
-    # Ждём подключения (макс. CONNECT_TIMEOUT сек ≈ 2 попытки 2FA)
+    # Ждём подключения (одна попытка, без ретраев)
     local i=0
     printf "${BLUE}[i]${NC} Ожидание (макс. %s сек) " "$CONNECT_TIMEOUT"
     while [ $i -lt $CONNECT_TIMEOUT ]; do
@@ -847,6 +878,15 @@ do_connect() {
             printf "${GREEN}[+]${NC} Podkop перезапущен\n"
             return 0
         fi
+        # После начального ожидания (4 сек) проверяем, жив ли openconnect.
+        # Если процесс завершился — авторизация провалилась, повторять нет смысла.
+        if [ $i -ge 4 ] && ! pgrep -x openconnect > /dev/null 2>&1; then
+            printf "\n"
+            printf "${RED}[-]${NC} Подключение не удалось (openconnect завершился)\n"
+            ifdown "$IFACE" 2>/dev/null
+            printf "${BLUE}[i]${NC} Проверьте: logread | grep openconnect\n"
+            return 1
+        fi
         printf "."
         sleep 2
         i=$((i + 2))
@@ -855,7 +895,7 @@ do_connect() {
     printf "\n"
     printf "${RED}[-]${NC} Не удалось подключиться за %s сек.\n" "$CONNECT_TIMEOUT"
     printf "${YELLOW}[!]${NC} Отменяю попытку подключения...\n"
-    ifdown "$IFACE"
+    ifdown "$IFACE" 2>/dev/null
     printf "${BLUE}[i]${NC} Проверьте: logread | grep openconnect\n"
     return 1
 }
@@ -1353,6 +1393,7 @@ return view.extend({
         var status = data[2] || {};
         var servers = uci.get('corpvpn', 'main', 'servers') || [];
         var disconnectTime = uci.get('corpvpn', 'main', 'disconnect_time') || '';
+        var autoReconnect = uci.get('corpvpn', 'main', 'auto_reconnect') || '0';
         var currentUri = uci.get('network', 'corp_vpn', 'uri') || '';
         var self = this;
 
@@ -1523,6 +1564,38 @@ return view.extend({
                 : E('p', { style: 'color:#999;margin-top:6px' }, 'Не настроено')
         ]);
 
+        /* ── Настройки ── */
+        var reconnectCheckbox = E('input', {
+            type: 'checkbox',
+            id: 'auto-reconnect',
+            checked: autoReconnect === '1' ? '' : null,
+            change: ui.createHandlerFn(this, function(ev) {
+                var val = ev.target.checked ? '1' : '0';
+                uci.set('corpvpn', 'main', 'auto_reconnect', val);
+                return uci.save().then(function() { return uci.apply(true); }).then(function() {
+                    ui.addNotification(null, E('p',
+                        val === '1'
+                            ? 'Автоматический реконнект включён'
+                            : 'Автоматический реконнект выключен'),
+                        'success');
+                });
+            })
+        });
+
+        var settingsBox = E('div', { 'class': 'cbi-section' }, [
+            E('h3', {}, 'Настройки'),
+            E('div', { style: 'display:flex;align-items:flex-start;gap:8px;margin-bottom:6px' }, [
+                reconnectCheckbox,
+                E('div', {}, [
+                    E('label', { 'for': 'auto-reconnect', style: 'font-weight:bold;cursor:pointer' }, 'Автоматический реконнект'),
+                    E('p', { style: 'color:#666;margin:4px 0 0;font-size:90%' },
+                        'При обрыве соединения VPN переподключится автоматически. ' +
+                        'Не включайте, если используется подтверждение через приложение (2FA push) — ' +
+                        'иначе сервер будет завален повторными запросами авторизации.')
+                ])
+            ])
+        ]);
+
         /* ── Автообновление статуса ── */
         poll.add(L.bind(this.pollStatus, this), 5);
 
@@ -1595,7 +1668,7 @@ return view.extend({
         ]);
 
         /* ══════════ Вкладки ══════════ */
-        var contentMain = E('div', {}, [statusBox, connBox, serversBox, routesBox, scheduleBox]);
+        var contentMain = E('div', {}, [statusBox, connBox, serversBox, routesBox, scheduleBox, settingsBox]);
         var contentDiag = E('div', { style: 'display:none' }, [versionBox, logsBox]);
 
         var tabMainBtn = E('li', { 'class': 'cbi-tab' }, E('a', { href: '#' }, 'Управление'));
@@ -1651,7 +1724,7 @@ first_connect() {
     echo ""
     ifup "$IFACE_NAME"
 
-    # Ожидание подключения (макс. 120 сек ≈ 2 попытки 2FA)
+    # Ожидание подключения (одна попытка, без ретраев)
     local i=0
     local max_wait=120
     printf "Ожидание (макс. %sс) " "$max_wait"
@@ -1674,6 +1747,14 @@ first_connect() {
             sleep 3
             ok "Podkop перезапущен"
             return 0
+        fi
+        # Если openconnect уже завершился — авторизация провалилась
+        if [ $i -ge 4 ] && ! pgrep -x openconnect > /dev/null 2>&1; then
+            printf "\n"
+            err "Подключение не удалось (openconnect завершился)"
+            ifdown "$IFACE_NAME" 2>/dev/null
+            warn "Проверьте логи: logread | grep openconnect"
+            return 1
         fi
         printf "."
         sleep 2
@@ -1784,9 +1865,10 @@ uninstall() {
     printf "  3. Удаление секций '%s' и '%s' из /etc/config/podkop\n" "$PODKOP_SECTION" "$PODKOP_PROXY_SECTION"
     printf "  4. Восстановление vpnc-script из бэкапа\n"
     printf "  5. Удаление скрипта %s\n" "$DAILY_SCRIPT"
-    printf "  6. Удаление автоотключения из cron\n"
-    printf "  7. Удаление LuCI-приложения и UCI-конфига\n"
-    printf "  8. (опционально) Удаление пакетов openconnect\n"
+    printf "  6. Удаление hotplug-скрипта (запрет авто-реконнекта)\n"
+    printf "  7. Удаление автоотключения из cron\n"
+    printf "  8. Удаление LuCI-приложения и UCI-конфига\n"
+    printf "  9. (опционально) Удаление пакетов openconnect\n"
     echo ""
 
     if ! ask_yesno "Продолжить откат?" "n"; then
@@ -1800,6 +1882,7 @@ uninstall() {
     uninstall_podkop
     uninstall_vpnc_patch
     uninstall_daily_script
+    uninstall_hotplug
     uninstall_cron
     uninstall_luci_app
     uninstall_uci_config
@@ -1886,6 +1969,16 @@ uninstall_daily_script() {
         ok "Скрипт удалён"
     else
         ok "Скрипт не найден (уже удалён)"
+    fi
+}
+
+uninstall_hotplug() {
+    info "Удаление hotplug-скрипта..."
+    if [ -f "$HOTPLUG_SCRIPT" ]; then
+        rm -f "$HOTPLUG_SCRIPT"
+        ok "Hotplug-скрипт удалён"
+    else
+        ok "Hotplug-скрипт не найден (уже удалён)"
     fi
 }
 
@@ -2086,6 +2179,7 @@ main_upgrade() {
     fi
 
     create_daily_script
+    install_hotplug_no_retry
     reorder_podkop_sections
 
     # Синхронизация автоотключения (UCI + cron)
@@ -2109,6 +2203,7 @@ main_upgrade() {
     if [ "$UCI_CONFIG_EXISTS" = "0" ]; then
         printf "  /etc/config/corpvpn           UCI-конфиг (создан)\n"
     fi
+    printf "  %-32s%s\n" "$HOTPLUG_SCRIPT" "Запрет авто-реконнекта"
     printf "  Services → Corp VPN           LuCI-приложение\n"
     echo ""
 
@@ -2160,6 +2255,7 @@ main_install() {
     test_connection
     patch_vpnc_script
     setup_interface
+    install_hotplug_no_retry
     setup_podkop
     gather_proxy_info
     setup_podkop_proxy
