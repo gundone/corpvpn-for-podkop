@@ -364,12 +364,27 @@ patch_vpnc_script() {
     # Патч: перенаправить DNS-файл из /tmp/dnsmasq.d/ в /tmp/
     sed -i 's|/tmp/dnsmasq\.d/openconnect\.|/tmp/openconnect-dns.|g' "$VPNC_SCRIPT"
 
+    # Патч: убрать проверку [ -d "/tmp/dnsmasq.d/" ] — на OpenWrt 24.10+
+    # dnsmasq использует /tmp/dnsmasq.<instance>.d/, а /tmp/dnsmasq.d/ не существует.
+    # Без этого фикса CISCO_SPLIT_DNS игнорируется.
+    sed -i 's| && \[ -d "/tmp/dnsmasq\.d/" \]||g' "$VPNC_SCRIPT"
+
     # Проверка
     if grep -q '/tmp/dnsmasq.d/openconnect' "$VPNC_SCRIPT"; then
         err "Патч не применился! Отредактируйте $VPNC_SCRIPT вручную:"
         err "Замените /tmp/dnsmasq.d/openconnect. на /tmp/openconnect-dns."
     else
         ok "vpnc-script пропатчен"
+    fi
+}
+
+# Фикс vpnc-script для upgrade: убрать проверку /tmp/dnsmasq.d/
+# если она ещё осталась (старые установки)
+patch_vpnc_splitdns_check() {
+    if [ -f "$VPNC_SCRIPT" ] && grep -q '\-d "/tmp/dnsmasq\.d/"' "$VPNC_SCRIPT"; then
+        info "Исправление vpnc-script: убираю проверку /tmp/dnsmasq.d/..."
+        sed -i 's| && \[ -d "/tmp/dnsmasq\.d/" \]||g' "$VPNC_SCRIPT"
+        ok "vpnc-script: проверка /tmp/dnsmasq.d/ убрана (CISCO_SPLIT_DNS будет работать)"
     fi
 }
 
@@ -423,43 +438,59 @@ setup_interface() {
 }
 
 # ============================================================
-# Hotplug: split DNS + запрет авто-реконнекта netifd
+# Hotplug: auto-add VPN domains to Podkop + запрет авто-реконнекта
 # ============================================================
 install_hotplug_no_retry() {
-    info "Установка hotplug-скрипта (split DNS + запрет авто-реконнекта)..."
+    info "Установка hotplug-скрипта (VPN DNS домены + запрет авто-реконнекта)..."
 
     mkdir -p "$(dirname "$HOTPLUG_SCRIPT")"
     cat > "$HOTPLUG_SCRIPT" << 'HOTPLUG_EOF'
 #!/bin/sh
 # Corp VPN hotplug script:
-# 1. On ifup  — set up split DNS from VPN-provided configuration
-# 2. On ifdown — clean up split DNS + prevent auto-retry (unless enabled)
+# 1. On ifup  — add VPN-provided domains to Podkop for DNS resolution
+# 2. On ifdown — prevent auto-retry (unless enabled)
+#
+# Note: dnsmasq split DNS doesn't work here because the corporate DNS
+# server is only reachable through the VPN tunnel. Podkop Domain Resolver
+# handles this correctly by routing DNS through the VPN interface.
 
 [ "$INTERFACE" = "corp_vpn" ] || exit 0
 
-SPLITDNS_CONF="/tmp/dnsmasq.d/corpvpn-splitdns.conf"
 OC_DNS_FILE="/tmp/openconnect-dns.vpn-corp_vpn"
+PODKOP_SECTION="corp"
+CONNECT_FLAG="/tmp/.corpvpn_user_connect"
 
 case "$ACTION" in
     ifup)
-        # VPN connected — extract split DNS entries from vpnc-script output.
-        # The vpnc-script writes DNS info to /tmp/openconnect-dns.* (patched path).
-        # We pick only domain-specific lines (server=/domain/ip) for dnsmasq,
-        # discarding catch-all lines (server=ip) that would break Podkop.
+        # VPN connected — extract domain suffixes from vpnc-script output
+        # and add them to Podkop so Domain Resolver handles them via VPN.
         if [ -f "$OC_DNS_FILE" ]; then
-            grep '^server=/' "$OC_DNS_FILE" > "$SPLITDNS_CONF" 2>/dev/null
-            if [ -s "$SPLITDNS_CONF" ]; then
-                /etc/init.d/dnsmasq restart 2>/dev/null
-            else
-                rm -f "$SPLITDNS_CONF"
+            _current=$(uci -q get "podkop.$PODKOP_SECTION.user_domains_text")
+            _changed=0
+            for _domain in $(sed -n 's|^server=/\([^/]*\)/.*|\1|p' "$OC_DNS_FILE"); do
+                case " $_current " in
+                    *" $_domain "*) ;;
+                    *)
+                        _current="${_current:+$_current }$_domain"
+                        _changed=1
+                        ;;
+                esac
+            done
+            if [ "$_changed" = "1" ]; then
+                uci set "podkop.$PODKOP_SECTION.user_domains_text=$_current"
+                uci commit podkop
+                service podkop restart > /dev/null 2>&1
             fi
         fi
+        # Clean up the flag — connection succeeded
+        rm -f "$CONNECT_FLAG"
         ;;
     ifdown)
-        # Clean up split DNS
-        if [ -f "$SPLITDNS_CONF" ]; then
-            rm -f "$SPLITDNS_CONF"
-            /etc/init.d/dnsmasq restart 2>/dev/null
+        # If user initiated this connect (corpvpn connect/restart or LuCI),
+        # the flag file exists — don't interfere with the reconnection.
+        if [ -f "$CONNECT_FLAG" ]; then
+            rm -f "$CONNECT_FLAG"
+            exit 0
         fi
 
         # Prevent netifd auto-retry (unless auto_reconnect is enabled)
@@ -894,12 +925,6 @@ do_connect() {
             printf "${GREEN}[+]${NC} Подключен!\n"
             show_status
             sync_routes_to_podkop
-            # Показать split DNS статус (настраивается hotplug-скриптом)
-            if [ -f /tmp/dnsmasq.d/corpvpn-splitdns.conf ]; then
-                local dns_count
-                dns_count=$(wc -l < /tmp/dnsmasq.d/corpvpn-splitdns.conf)
-                printf "${BLUE}[i]${NC} Split DNS: %s доменов через корп. DNS\n" "$dns_count"
-            fi
             printf "${BLUE}[i]${NC} Перезапуск Podkop...\n"
             service podkop restart > /dev/null 2>&1
             sleep 2
@@ -908,7 +933,7 @@ do_connect() {
         fi
         # После начального ожидания (4 сек) проверяем, жив ли openconnect.
         # Если процесс завершился — авторизация провалилась, повторять нет смысла.
-        if [ $i -ge 4 ] && ! pgrep -x openconnect > /dev/null 2>&1; then
+        if [ $i -ge 4 ] && ! pgrep openconnect > /dev/null 2>&1; then
             printf "\n"
             printf "${RED}[-]${NC} Подключение не удалось (openconnect завершился)\n"
             ifdown "$IFACE" 2>/dev/null
@@ -930,9 +955,11 @@ do_connect() {
 
 do_disconnect() {
     printf "${BLUE}[i]${NC} Отключение VPN...\n"
+    # Flag tells hotplug this is a user action, not a connection drop
+    touch /tmp/.corpvpn_user_connect
     ifdown "$IFACE"
-    # Split DNS очищается hotplug-скриптом при ifdown
     sleep 1
+    rm -f /tmp/.corpvpn_user_connect
     printf "${GREEN}[+]${NC} VPN отключен\n"
 }
 
@@ -1201,7 +1228,7 @@ case "$1" in
                 _pending=$(echo "$_json" | jsonfilter -e '@.pending' 2>/dev/null)
                 _ip=$(echo "$_json" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
                 _uri=$(uci -q get network.corp_vpn.uri)
-                _oc_running=$(pgrep -x openconnect > /dev/null 2>&1 && echo 1 || echo 0)
+                _oc_running=$(pgrep openconnect > /dev/null 2>&1 && echo 1 || echo 0)
                 json_init
                 if [ "$_up" = "true" ]; then
                     json_add_boolean "up" 1
@@ -1217,9 +1244,6 @@ case "$1" in
                 json_add_string "server" "${_uri:-}"
                 _rc=$(ip route 2>/dev/null | grep -c "dev vpn-corp_vpn")
                 json_add_int "route_count" "${_rc:-0}"
-                _dc=0
-                [ -f /tmp/dnsmasq.d/corpvpn-splitdns.conf ] && _dc=$(wc -l < /tmp/dnsmasq.d/corpvpn-splitdns.conf)
-                json_add_int "dns_count" "${_dc:-0}"
                 json_dump
                 ;;
             getRoutes)
@@ -1268,13 +1292,16 @@ case "$1" in
                     uci set "network.corp_vpn.uri=$server"
                     uci commit network
                 fi
+                touch /tmp/.corpvpn_user_connect
                 ifup corp_vpn 2>/dev/null
                 json_init
                 json_add_boolean "ok" 1
                 json_dump
                 ;;
             disconnect)
+                touch /tmp/.corpvpn_user_connect
                 ifdown corp_vpn 2>/dev/null
+                rm -f /tmp/.corpvpn_user_connect
                 json_init
                 json_add_boolean "ok" 1
                 json_dump
@@ -1410,7 +1437,6 @@ return view.extend({
             var ipEl = document.getElementById('vpn-ip');
             var srvEl = document.getElementById('vpn-srv');
             var rtEl = document.getElementById('vpn-routes');
-            var dnsEl = document.getElementById('vpn-dns');
             if (!dot) return;
             dot.style.background = statusColor(s);
             txt.textContent = statusText(s);
@@ -1418,9 +1444,6 @@ return view.extend({
             srvEl.textContent = 'Сервер: ' + ((s && s.server) || 'N/A');
             if (rtEl) {
                 rtEl.textContent = (s && s.up && s.route_count) ? 'Маршрутов: ' + s.route_count : '';
-            }
-            if (dnsEl) {
-                dnsEl.textContent = (s && s.up && s.dns_count) ? 'Split DNS: ' + s.dns_count + ' доменов' : '';
             }
         });
     },
@@ -1445,8 +1468,7 @@ return view.extend({
                 ]),
                 E('div', { id: 'vpn-ip' }, status.up ? 'IP: ' + (status.ip || 'N/A') : ''),
                 E('div', { id: 'vpn-srv' }, 'Сервер: ' + (status.server || 'N/A')),
-                E('div', { id: 'vpn-routes' }, (status.up && status.route_count) ? 'Маршрутов: ' + status.route_count : ''),
-                E('div', { id: 'vpn-dns' }, (status.up && status.dns_count) ? 'Split DNS: ' + status.dns_count + ' доменов' : '')
+                E('div', { id: 'vpn-routes' }, (status.up && status.route_count) ? 'Маршрутов: ' + status.route_count : '')
             ])
         ]);
 
@@ -1786,7 +1808,7 @@ first_connect() {
             return 0
         fi
         # Если openconnect уже завершился — авторизация провалилась
-        if [ $i -ge 4 ] && ! pgrep -x openconnect > /dev/null 2>&1; then
+        if [ $i -ge 4 ] && ! pgrep openconnect > /dev/null 2>&1; then
             printf "\n"
             err "Подключение не удалось (openconnect завершился)"
             ifdown "$IFACE_NAME" 2>/dev/null
@@ -2217,6 +2239,7 @@ main_upgrade() {
 
     create_daily_script
     install_hotplug_no_retry
+    patch_vpnc_splitdns_check
     reorder_podkop_sections
 
     # Синхронизация автоотключения (UCI + cron)
