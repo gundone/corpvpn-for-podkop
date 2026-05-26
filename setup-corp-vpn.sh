@@ -31,7 +31,7 @@ LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
 HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-corpvpn-no-retry"
-CORPVPN_VERSION="1.3.0"
+CORPVPN_VERSION="1.3.1"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
@@ -119,6 +119,57 @@ cleanup() {
 trap cleanup EXIT
 
 # ============================================================
+# Абстракция над пакетным менеджером (apk для 25.12+, opkg для 24.10)
+# ============================================================
+if command -v apk > /dev/null 2>&1; then
+    PKG_MGR="apk"
+elif command -v opkg > /dev/null 2>&1; then
+    PKG_MGR="opkg"
+else
+    PKG_MGR=""
+fi
+
+pkg_is_installed() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        apk info -e "$1" > /dev/null 2>&1
+    elif [ "$PKG_MGR" = "opkg" ]; then
+        opkg list-installed 2>/dev/null | grep -q "^$1 "
+    else
+        return 1
+    fi
+}
+
+pkg_update() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        apk update > /dev/null 2>&1
+    elif [ "$PKG_MGR" = "opkg" ]; then
+        opkg update > /dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+pkg_install() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        apk add "$1"
+    elif [ "$PKG_MGR" = "opkg" ]; then
+        opkg install "$1"
+    else
+        return 1
+    fi
+}
+
+pkg_remove() {
+    if [ "$PKG_MGR" = "apk" ]; then
+        apk del "$1" 2>/dev/null
+    elif [ "$PKG_MGR" = "opkg" ]; then
+        opkg remove "$1" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# ============================================================
 # Шаг 0: Проверка предусловий
 # ============================================================
 check_prerequisites() {
@@ -132,13 +183,19 @@ check_prerequisites() {
     . /etc/openwrt_release
     ok "OpenWrt: $DISTRIB_DESCRIPTION"
 
-    if ! opkg list-installed 2>/dev/null | grep -q "^podkop "; then
+    if [ -z "$PKG_MGR" ]; then
+        err "Не найден пакетный менеджер (ни apk, ни opkg)"
+        exit 1
+    fi
+    ok "Пакетный менеджер: $PKG_MGR"
+
+    if ! pkg_is_installed podkop; then
         err "Podkop не установлен. Сначала установите Podkop."
         exit 1
     fi
     ok "Podkop установлен"
 
-    if opkg list-installed 2>/dev/null | grep -q "^sing-box"; then
+    if pkg_is_installed sing-box; then
         ok "sing-box установлен"
     fi
 
@@ -160,8 +217,8 @@ install_packages() {
     local oc_installed=0
     local luci_installed=0
 
-    opkg list-installed 2>/dev/null | grep -q "^openconnect " && oc_installed=1
-    opkg list-installed 2>/dev/null | grep -q "^luci-proto-openconnect " && luci_installed=1
+    pkg_is_installed openconnect && oc_installed=1
+    pkg_is_installed luci-proto-openconnect && luci_installed=1
 
     if [ "$oc_installed" -eq 1 ] && [ "$luci_installed" -eq 1 ]; then
         ok "Все пакеты уже установлены"
@@ -169,13 +226,13 @@ install_packages() {
     fi
 
     info "Обновление списка пакетов..."
-    if ! opkg update > /dev/null 2>&1; then
-        warn "opkg update завершился с ошибкой (может быть нормально)"
+    if ! pkg_update; then
+        warn "Обновление списка пакетов завершилось с ошибкой (может быть нормально)"
     fi
 
     if [ "$oc_installed" -eq 0 ]; then
         info "Установка openconnect..."
-        if ! opkg install openconnect; then
+        if ! pkg_install openconnect; then
             err "Не удалось установить openconnect"
             exit 1
         fi
@@ -183,7 +240,7 @@ install_packages() {
 
     if [ "$luci_installed" -eq 0 ]; then
         info "Установка luci-proto-openconnect..."
-        if ! opkg install luci-proto-openconnect; then
+        if ! pkg_install luci-proto-openconnect; then
             warn "Не удалось установить luci-proto-openconnect (LuCI может быть недоступен)"
         fi
     fi
@@ -2120,14 +2177,14 @@ uninstall_packages() {
         return 0
     fi
 
-    if opkg list-installed 2>/dev/null | grep -q "^luci-proto-openconnect "; then
+    if pkg_is_installed luci-proto-openconnect; then
         info "Удаление luci-proto-openconnect..."
-        opkg remove luci-proto-openconnect 2>/dev/null
+        pkg_remove luci-proto-openconnect
     fi
 
-    if opkg list-installed 2>/dev/null | grep -q "^openconnect "; then
+    if pkg_is_installed openconnect; then
         info "Удаление openconnect..."
-        opkg remove openconnect 2>/dev/null
+        pkg_remove openconnect
     fi
 
     ok "Пакеты удалены"
