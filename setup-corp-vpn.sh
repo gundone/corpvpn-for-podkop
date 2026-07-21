@@ -31,7 +31,7 @@ LUCI_VIEW="/www/luci-static/resources/view/corpvpn.js"
 LUCI_MENU="/usr/share/luci/menu.d/luci-app-corpvpn.json"
 LUCI_ACL="/usr/share/rpcd/acl.d/luci-app-corpvpn.json"
 HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-corpvpn-no-retry"
-CORPVPN_VERSION="1.3.1"
+CORPVPN_VERSION="1.4.0"
 CORPVPN_REPO="gundone/corpvpn-for-podkop"
 
 # Собранные данные (заполняются в процессе)
@@ -1539,6 +1539,7 @@ return view.extend({
         var autoReconnect = uci.get('corpvpn', 'main', 'auto_reconnect') || '0';
         var vpnMtu = uci.get('corpvpn', 'main', 'mtu') || '1300';
         var currentUri = uci.get('network', 'corp_vpn', 'uri') || '';
+        var currentPassword = uci.get('network', 'corp_vpn', 'password') || '';
         var self = this;
 
         if (typeof servers === 'string') servers = [servers];
@@ -1563,11 +1564,39 @@ return view.extend({
             select.appendChild(E('option', { value: srv, selected: srv === currentUri ? '' : null }, srv));
         });
 
+        var pwInput = E('input', {
+            id: 'vpn-password',
+            type: 'password',
+            'class': 'cbi-input-text',
+            value: currentPassword,
+            style: 'width:200px;border-top-right-radius:0;border-bottom-right-radius:0',
+            change: ui.createHandlerFn(this, function(ev) {
+                uci.set('network', 'corp_vpn', 'password', ev.target.value);
+                return uci.save().then(function() { return uci.apply(true); }).then(function() {
+                    ui.addNotification(null, E('p', 'Пароль сохранён'), 'success');
+                });
+            })
+        });
+
+        var pwToggleBtn = E('button', {
+            type: 'button',
+            'class': 'cbi-button',
+            style: 'margin-left:-1px;padding:2px 6px 0px 6px;border-top-left-radius:0;border-bottom-left-radius:0',
+            click: function(ev) {
+                ev.preventDefault();
+                pwInput.type = pwInput.type === 'text' ? 'password' : 'text';
+            }
+        }, E('span', { style: 'position:relative;top:2px' }, '*'));
+
         var connBox = E('div', { 'class': 'cbi-section' }, [
             E('h3', {}, 'Подключение'),
             E('div', { style: 'margin-bottom:10px' }, [
                 E('label', { style: 'display:block;margin-bottom:4px;font-weight:bold' }, 'Сервер:'),
                 select
+            ]),
+            E('div', { style: 'margin-bottom:10px' }, [
+                E('label', { 'for': 'vpn-password', style: 'display:block;margin-bottom:4px;font-weight:bold' }, 'Пароль:'),
+                E('div', { style: 'display:flex' }, [pwInput, pwToggleBtn])
             ]),
             E('div', { style: 'display:flex;gap:6px;flex-wrap:wrap' }, [
                 E('button', {
